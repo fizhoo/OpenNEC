@@ -139,7 +139,9 @@ def main():
         temp = Path(temporary)
         binary = temp / "nec2-fortran"
         compile_result = subprocess.run(
-            [args.gfortran, "-std=legacy", "-ffixed-form", "-fallow-argument-mismatch", "-O2", str(source), str(shim), "-o", str(binary)],
+            # The historical source relies on array aliasing that modern gfortran
+            # miscompiles at -O2; Yeti's NEC2 build also uses -O0.
+            [args.gfortran, "-std=legacy", "-ffixed-form", "-fallow-argument-mismatch", "-O0", str(source), str(shim), "-o", str(binary)],
             capture_output=True,
             text=True,
         )
