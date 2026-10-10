@@ -226,6 +226,74 @@ static void restore_geometry(context_t *ctx, const card_state_t *state)
     }
 }
 
+/*
+ * The sequential processor restores geometry to metres after a frequency
+ * loop.  A field request read after that loop must use the already-solved
+ * final-frequency currents, but field routines expect geometry in wavelength
+ * units.  This is the IGO=4/5 path in the original NEC-2 control flow.
+ */
+static void output_existing_field_request(context_t *ctx)
+{
+    if (!ctx || ctx->save.freq_mhz <= 0.0) return;
+
+    double fr = ctx->save.freq_mhz / CVEL;
+    for (int i = 0; i < ctx->geometry.num_segs; i++) {
+        ctx->geometry.x_center[i] *= fr;
+        ctx->geometry.y_center[i] *= fr;
+        ctx->geometry.z_center[i] *= fr;
+        ctx->geometry.half_len[i] *= fr;
+        ctx->geometry.radius[i] *= fr;
+    }
+    if (ctx->geometry.num_patches > 0) {
+        double fr2 = fr * fr;
+        for (int i = 0; i < ctx->geometry.num_patches; i++) {
+            ctx->geometry.patch_x_center[i] *= fr;
+            ctx->geometry.patch_y_center[i] *= fr;
+            ctx->geometry.patch_z_center[i] *= fr;
+            ctx->geometry.patch_area[i] *= fr2;
+        }
+    }
+
+    if (ctx->gnd.far_field_type != -1) {
+        ctx->fpat.power_in = ctx->netcx.power_in;
+        ctx->fpat.network_loss = ctx->netcx.power_net_loss;
+        compute_radiation_pattern(ctx);
+    }
+    if (ctx->fpat.is_near_field != -1) {
+        compute_near_field(ctx);
+    }
+    if (ctx->output_fp) {
+        write_extra_pattern_output(ctx->output_fp, ctx);
+    }
+
+    if (ctx->rpat.points != NULL) {
+        mem_free(ctx, (void **)&ctx->rpat.points);
+        ctx->rpat.num_points = 0;
+    }
+    if (ctx->nfr.points != NULL) {
+        free(ctx->nfr.points);
+        ctx->nfr.points = NULL;
+        ctx->nfr.num_points = 0;
+    }
+
+    for (int i = 0; i < ctx->geometry.num_segs; i++) {
+        ctx->geometry.x_center[i] /= fr;
+        ctx->geometry.y_center[i] /= fr;
+        ctx->geometry.z_center[i] /= fr;
+        ctx->geometry.half_len[i] /= fr;
+        ctx->geometry.radius[i] /= fr;
+    }
+    if (ctx->geometry.num_patches > 0) {
+        double fr2 = fr * fr;
+        for (int i = 0; i < ctx->geometry.num_patches; i++) {
+            ctx->geometry.patch_x_center[i] /= fr;
+            ctx->geometry.patch_y_center[i] /= fr;
+            ctx->geometry.patch_z_center[i] /= fr;
+            ctx->geometry.patch_area[i] /= fr2;
+        }
+    }
+}
+
 /* ============================================================================
  * Main Processing Loop
  * ========================================================================== */
@@ -973,7 +1041,7 @@ static int process_xq_card(context_t *ctx, deck_t *deck, int card_idx,
     if (!ctx || !deck || !state) return -1;
     
     const card_t *card = &deck->cards[card_idx];
-    
+
     /* Check if this is a request to skip */
     if (state->card_sequence_state == 10 && card->i[1] == 0) {
         return 0;  /* Skip */
@@ -991,94 +1059,14 @@ static int process_xq_card(context_t *ctx, deck_t *deck, int card_idx,
         state->card_sequence_state = 7;   /* iflow=7, XQ without parameter, before patterns */
     }
     
-    /* Look ahead to collect RP/NE/NH cards that follow this XQ */
-    state->num_rp_cards = 0;  /* Reset RP card collection for this XQ */
-    int last_pattern_idx = card_idx;
-    
-    for (int i = card_idx + 1; i < deck->num_cards; i++) {
-        card_t *next_card = &deck->cards[i];
-        
-        /* Skip comments and ignored cards */
-        if (is_comment(next_card) || next_card->ignore) {
-            continue;
-        }
-        
-        /* Collect RP/NE/NH cards */
-        if (strcmp(next_card->card_code, "RP") == 0 && state->num_rp_cards < MAX_RP_CARDS_PER_FREQUENCY) {
-            /* Extract RP card parameters */
-            int n_theta = (next_card->i[2] == 0) ? 1 : next_card->i[2];
-            int n_phi = (next_card->i[3] == 0) ? 1 : next_card->i[3];
-            double theta_start = next_card->f[1];
-            double phi_start = next_card->f[2];
-            double theta_step = next_card->f[3];
-            double phi_step = next_card->f[4];
-            
-            state->rp_cards[state->num_rp_cards].num_theta = n_theta;
-            state->rp_cards[state->num_rp_cards].num_phi = n_phi;
-            state->rp_cards[state->num_rp_cards].theta_start = theta_start;
-            state->rp_cards[state->num_rp_cards].phi_start = phi_start;
-            state->rp_cards[state->num_rp_cards].theta_step = theta_step;
-            state->rp_cards[state->num_rp_cards].phi_step = phi_step;
-            state->num_rp_cards++;
-            
-            last_pattern_idx = i;
-            /* Set far_field_type to 0 if not already set (matches NEC-2 RP card default) */
-            if (ctx->gnd.far_field_type == -1) {
-                ctx->gnd.far_field_type = 0;
-            }
-        } else if (strcmp(next_card->card_code, "NE") == 0 || strcmp(next_card->card_code, "NH") == 0) {
-            /* NE/NH cards are near-field requests, mark but don't collect yet */
-            last_pattern_idx = i;
-        } else if (strcmp(next_card->card_code, "PT") == 0 || strcmp(next_card->card_code, "PQ") == 0) {
-            /* PT/PQ cards follow patterns, mark position */
-            last_pattern_idx = i;
-        } else {
-            /* Any other card type ends the pattern sequence */
-            break;
-        }
-    }
-    
-    /* Store last pattern index so main card loop can skip these cards */
-    state->last_processed_pattern_idx = last_pattern_idx;
-    
-    /* Output RP/NE/NH/PT/PQ DATA CARD entries BEFORE frequency loop
-     * These should appear immediately after the XQ card in the output */
-    if (ctx->output_fp) {
-        for (int i = card_idx + 1; i <= last_pattern_idx; i++) {
-            card_t *pattern_card = &deck->cards[i];
-            
-            /* Skip comments and ignored cards */
-            if (is_comment(pattern_card) || pattern_card->ignore) {
-                continue;
-            }
-            
-            /* Output RP, NE, NH, PT, PQ cards with DATA CARD numbers */
-            if (strcmp(pattern_card->card_code, "RP") == 0 ||
-                strcmp(pattern_card->card_code, "NE") == 0 ||
-                strcmp(pattern_card->card_code, "NH") == 0 ||
-                strcmp(pattern_card->card_code, "PT") == 0 ||
-                strcmp(pattern_card->card_code, "PQ") == 0) {
-                
-                state->total_cards_processed++;
-                fprintf(ctx->output_fp,
-                    "  DATA CARD No: %3d "
-                    "%s %3d %5d %5d %5d %12.5E %12.5E %12.5E %12.5E %12.5E %12.5E\n",
-                    state->total_cards_processed, pattern_card->card_code,
-                    pattern_card->i[1], pattern_card->i[2], pattern_card->i[3], pattern_card->i[4],
-                    pattern_card->f[1], pattern_card->f[2], pattern_card->f[3], 
-                    pattern_card->f[4], pattern_card->f[5], pattern_card->f[6]);
-            }
-        }
-    }
-    
-    /* Execute frequency loop */
-    fflush(stderr);
-    
-    int result = execute_frequency_loop_sequential(ctx, deck, card_idx, state);
-    
-    fflush(stderr);
-    
-    return result;
+    /*
+     * NEC-2 reads cards in execution order.  In particular, an RP/NE/NH
+     * after XQ is a later request, not data to fold into XQ's frequency loop.
+     * Leave it for the main card loop to dispatch after the solve completes.
+     */
+    state->num_rp_cards = 0;
+    state->last_processed_pattern_idx = -1;
+    return execute_frequency_loop_sequential(ctx, deck, card_idx, state);
 }
 
 /**
@@ -1097,102 +1085,33 @@ static int process_rp_card(context_t *ctx, deck_t *deck, int card_idx,
                           card_state_t *state)
 {
     if (!ctx || !deck || !state) return -1;
-    
     const card_t *card = &deck->cards[card_idx];
-    
-    /* If RP is the first pattern request (no XQ), treat it as execute card */
-    if (state->num_rp_cards == 0 && state->card_sequence_state < 7) {
-        /* This RP is acting as the execute request card
-         * Collect this RP and any following RP/NE/NH cards, then execute */
-        
-        state->card_sequence_state = 7;  /* Mark that we're in pattern collection */
-        state->num_rp_cards = 0;  /* Reset RP card collection */
-        int last_pattern_idx = card_idx;
-        
-        /* Collect this RP and any following RP/NE/NH cards */
-        for (int i = card_idx; i < deck->num_cards; i++) {
-            card_t *pattern_card = &deck->cards[i];
-            
-            /* Skip comments and ignored cards */
-            if (is_comment(pattern_card) || pattern_card->ignore) {
-                continue;
-            }
-            
-            /* Collect RP cards */
-            if (strcmp(pattern_card->card_code, "RP") == 0 && state->num_rp_cards < MAX_RP_CARDS_PER_FREQUENCY) {
-                int n_theta = (pattern_card->i[2] == 0) ? 1 : pattern_card->i[2];
-                int n_phi = (pattern_card->i[3] == 0) ? 1 : pattern_card->i[3];
-                
-                state->rp_cards[state->num_rp_cards].num_theta = n_theta;
-                state->rp_cards[state->num_rp_cards].num_phi = n_phi;
-                state->rp_cards[state->num_rp_cards].theta_start = pattern_card->f[1];
-                state->rp_cards[state->num_rp_cards].phi_start = pattern_card->f[2];
-                state->rp_cards[state->num_rp_cards].theta_step = pattern_card->f[3];
-                state->rp_cards[state->num_rp_cards].phi_step = pattern_card->f[4];
-                state->num_rp_cards++;
-                
-                last_pattern_idx = i;
-                if (ctx->gnd.far_field_type == -1) {
-                    ctx->gnd.far_field_type = 0;
-                }
-            } else if (strcmp(pattern_card->card_code, "NE") == 0 || 
-                      strcmp(pattern_card->card_code, "NH") == 0) {
-                /* NE/NH cards follow patterns, mark position */
-                last_pattern_idx = i;
-            } else if (strcmp(pattern_card->card_code, "PT") == 0 || 
-                      strcmp(pattern_card->card_code, "PQ") == 0) {
-                /* PT/PQ cards follow patterns, mark position */
-                last_pattern_idx = i;
-            } else if (strcmp(pattern_card->card_code, "EN") != 0) {
-                /* Any other non-EN card ends the pattern sequence */
-                break;
-            }
-        }
-        
-        /* Store last pattern index so main card loop can skip these cards */
-        state->last_processed_pattern_idx = last_pattern_idx;
-        
-        /* Output RP/NE/NH/PT/PQ DATA CARD entries BEFORE frequency loop */
-        if (ctx->output_fp) {
-            for (int i = card_idx; i <= last_pattern_idx; i++) {
-                card_t *pattern_card = &deck->cards[i];
-                
-                if (is_comment(pattern_card) || pattern_card->ignore) {
-                    continue;
-                }
-                
-                if (strcmp(pattern_card->card_code, "RP") == 0 ||
-                    strcmp(pattern_card->card_code, "NE") == 0 ||
-                    strcmp(pattern_card->card_code, "NH") == 0 ||
-                    strcmp(pattern_card->card_code, "PT") == 0 ||
-                    strcmp(pattern_card->card_code, "PQ") == 0) {
-                    
-                    state->total_cards_processed++;
-                    fprintf(ctx->output_fp,
-                        "  DATA CARD No: %3d "
-                        "%s %3d %5d %5d %5d %12.5E %12.5E %12.5E %12.5E %12.5E %12.5E\n",
-                        state->total_cards_processed, pattern_card->card_code,
-                        pattern_card->i[1], pattern_card->i[2], pattern_card->i[3], pattern_card->i[4],
-                        pattern_card->f[1], pattern_card->f[2], pattern_card->f[3], 
-                        pattern_card->f[4], pattern_card->f[5], pattern_card->f[6]);
-                }
-            }
-        }
-        
-        /* Execute frequency loop (this RP triggers execution) */
-        return execute_frequency_loop_sequential(ctx, deck, card_idx, state);
-    }
-    
-    /* RP is part of a pattern collection (after XQ), just update parameters
-     * The XQ handler already triggered frequency execution, so we just store params */
-    ctx->fpat.num_theta = card->i[2];
-    ctx->fpat.num_phi = card->i[3];
+
+    ctx->gnd.far_field_type = card->i[1];
+    ctx->fpat.num_theta = card->i[2] == 0 ? 1 : card->i[2];
+    ctx->fpat.num_phi = card->i[3] == 0 ? 1 : card->i[3];
     ctx->fpat.theta_start = card->f[1];
     ctx->fpat.phi_start = card->f[2];
     ctx->fpat.theta_step = card->f[3];
     ctx->fpat.phi_step = card->f[4];
-    ctx->fpat.is_near_field = 0;
-    
+    ctx->fpat.is_near_field = -1;
+
+    if (state->processing_stage < 4) {
+        /* This first RP starts the automatic loop and remains active in it. */
+        state->num_rp_cards = 1;
+        state->rp_cards[0].num_theta = ctx->fpat.num_theta;
+        state->rp_cards[0].num_phi = ctx->fpat.num_phi;
+        state->rp_cards[0].theta_start = ctx->fpat.theta_start;
+        state->rp_cards[0].phi_start = ctx->fpat.phi_start;
+        state->rp_cards[0].theta_step = ctx->fpat.theta_step;
+        state->rp_cards[0].phi_step = ctx->fpat.phi_step;
+        state->card_sequence_state = 10;
+        return execute_frequency_loop_sequential(ctx, deck, card_idx, state);
+    }
+
+    /* Subsequent RP cards use the final-frequency currents only. */
+    state->card_sequence_state = 10;
+    output_existing_field_request(ctx);
     return 0;
 }
 
@@ -1213,6 +1132,23 @@ static int process_ne_card(context_t *ctx, deck_t *deck, int card_idx,
     if (!ctx || !deck || !state) return -1;
     
     const card_t *card = &deck->cards[card_idx];
+
+    /* NEC-2 does not let NE initiate an automatic frequency loop. */
+    if (state->num_frequencies != 1 && state->processing_stage < 4) {
+        ctx->fpat.is_near_field = card->i[1];
+        ctx->fpat.near_field_type = 0;
+        ctx->fpat.grid_nx = card->i[2];
+        ctx->fpat.grid_ny = card->i[3];
+        ctx->fpat.grid_nz = card->i[4];
+        ctx->fpat.grid_x0 = card->f[1];
+        ctx->fpat.grid_y0 = card->f[2];
+        ctx->fpat.grid_z0 = card->f[3];
+        ctx->fpat.grid_dx = card->f[4];
+        ctx->fpat.grid_dy = card->f[5];
+        ctx->fpat.grid_dz = card->f[6];
+        state->card_sequence_state = 8;
+        return 0;
+    }
     
     /* If NE is the first pattern request (no XQ), treat it as execute card */
     if (state->num_rp_cards == 0 && state->card_sequence_state < 7) {
@@ -1298,7 +1234,7 @@ static int process_ne_card(context_t *ctx, deck_t *deck, int card_idx,
     }
     
     /* NE is part of a pattern collection (after XQ/RP), just update parameters */
-    ctx->fpat.is_near_field = 1;
+    ctx->fpat.is_near_field = card->i[1];
     ctx->fpat.near_field_type = 0;  /* E-field */
     ctx->fpat.grid_nx = card->i[2];
     ctx->fpat.grid_ny = card->i[3];
@@ -1327,6 +1263,23 @@ static int process_nh_card(context_t *ctx, deck_t *deck, int card_idx,
     if (!ctx || !deck || !state) return -1;
     
     const card_t *card = &deck->cards[card_idx];
+
+    /* NEC-2 does not let NH initiate an automatic frequency loop. */
+    if (state->num_frequencies != 1 && state->processing_stage < 4) {
+        ctx->fpat.is_near_field = card->i[1];
+        ctx->fpat.near_field_type = 1;
+        ctx->fpat.grid_nx = card->i[2];
+        ctx->fpat.grid_ny = card->i[3];
+        ctx->fpat.grid_nz = card->i[4];
+        ctx->fpat.grid_x0 = card->f[1];
+        ctx->fpat.grid_y0 = card->f[2];
+        ctx->fpat.grid_z0 = card->f[3];
+        ctx->fpat.grid_dx = card->f[4];
+        ctx->fpat.grid_dy = card->f[5];
+        ctx->fpat.grid_dz = card->f[6];
+        state->card_sequence_state = 9;
+        return 0;
+    }
     
     /* If NH is the first pattern request (no XQ), treat it as execute card */
     if (state->num_rp_cards == 0 && state->card_sequence_state < 7) {
@@ -1412,8 +1365,8 @@ static int process_nh_card(context_t *ctx, deck_t *deck, int card_idx,
     }
     
     /* NH is part of a pattern collection (after XQ/RP/NE), just update parameters */
-    ctx->fpat.is_near_field = 1;
-    ctx->fpat.near_field_type = 0;  /* E-field */
+    ctx->fpat.is_near_field = card->i[1];
+    ctx->fpat.near_field_type = 1;  /* H-field */
     ctx->fpat.grid_nx = card->i[2];
     ctx->fpat.grid_ny = card->i[3];
     ctx->fpat.grid_nz = card->i[4];
@@ -1832,10 +1785,14 @@ static int execute_frequency_loop_sequential(context_t *ctx, deck_t *deck,
         
         /* Write all frequency-dependent output (antenna input, currents, power) BEFORE patterns
            Only output once per unique frequency, not for every XQ in that frequency */
-        if (state->processing_stage >= 4 && ctx->output_fp &&
-            fabs(state->current_frequency_mhz - state->last_freq_output_mhz) > 1e-6) {
-            write_frequency_step_output(ctx->output_fp, ctx);
-            state->last_freq_output_mhz = state->current_frequency_mhz;
+        if (state->processing_stage >= 4 && ctx->output_fp) {
+            if (fabs(state->current_frequency_mhz - state->last_freq_output_mhz) > 1e-6) {
+                write_frequency_step_output(ctx->output_fp, ctx);
+                state->last_freq_output_mhz = state->current_frequency_mhz;
+            } else {
+                /* A later EX/XQ pair changes currents at this same frequency. */
+                write_subsequent_excitation_output(ctx->output_fp, ctx, deck);
+            }
         }
         
         /* Compute and output radiation patterns if collected from look-ahead */
