@@ -669,6 +669,13 @@ void write_single_radiation_pattern(FILE *file, context_t *ctx)
   write_radiation_pattern_data(file, ctx);
 }
 
+/* Near-field section (and plot file) for one field request. */
+void write_near_field_output(FILE *file, context_t *ctx)
+{
+  write_near_field_data(file, ctx);
+  write_near_field_plot(ctx);
+}
+
 void write_nec_output(context_t *ctx, const deck_t *deck, FILE *file)
 {
   if (ctx->freq_step_output_written) {

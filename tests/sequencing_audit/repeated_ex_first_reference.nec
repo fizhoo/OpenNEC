@@ -1,0 +1,8 @@
+CM Reference for the first EX/XQ solve
+CE
+GW 1 21 -5.03 0 9.144 5.03 0 9.144 0.001
+GE 0
+EX 0 1 11 0 1 0
+FR 0 1 0 0 14.0 0
+XQ 0
+EN

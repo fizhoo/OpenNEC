@@ -30,6 +30,28 @@
         "tests/golden_tests/decks/*.out",
         "{TMPDIR}/golden-*"
       ]
+    },
+    {
+      "id": "sequencing-audit",
+      "name": "NEC-2 Sequencing Semantics",
+      "description": "Numerical regression checks for FR/XQ/RP, repeated RP, NE execution, and repeated EX/XQ.",
+      "runner": "tests/sequencing_audit/run_sequencing_audit_tests.py",
+      "required": true,
+      "platforms": ["Linux", "Darwin", "Windows"],
+      "args": ["--onec", "{ONEC_BIN}"],
+      "timeout_seconds": 60,
+      "cleanup_patterns": ["{TMPDIR}/onec-sequencing-audit-*"]
+    },
+    {
+      "id": "fortran-reference",
+      "name": "Original NEC-2 Fortran Reference",
+      "description": "Compiles the bundled NEC-2 Fortran source and checks OpenNEC sequencing results against it.",
+      "runner": "tests/fortran_reference/run_fortran_reference_tests.py",
+      "required": true,
+      "platforms": ["Linux"],
+      "args": ["--onec", "{ONEC_BIN}"],
+      "timeout_seconds": 120,
+      "cleanup_patterns": ["{TMPDIR}/onec-fortran-reference-*"]
     }
   ]
 }
