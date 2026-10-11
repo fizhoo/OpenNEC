@@ -81,6 +81,7 @@ void write_subsequent_excitation_output(FILE *file, context_t *ctx, const deck_t
  * @param ctx  The simulation context (provides rpat data).
  */
 void write_single_radiation_pattern(FILE *file, context_t *ctx);
+void write_near_field_output(FILE *file, context_t *ctx);
 
 /**
  * @brief Echoes the current batch's control cards before its frequency output.
